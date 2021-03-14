@@ -1,0 +1,77 @@
+diff --git a/arch/x86/entry/syscalls/syscall_64.tbl b/arch/x86/entry/syscalls/syscall_64.tbl
+index 78847b32e137..f3aa49d62a0d 100644
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@ -360,6 +360,7 @@
+ 437	common	openat2			sys_openat2
+ 438	common	pidfd_getfd		sys_pidfd_getfd
+ 439	common	faccessat2		sys_faccessat2
++440	common	s2_encrypt		sys_s2_encrypt
+ 
+ #
+ # x32-specific system call numbers start at 512 to avoid cache impact
+diff --git a/kernel/Makefile b/kernel/Makefile
+index f3218bc5ec69..d00001f39050 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -40,6 +40,7 @@ CFLAGS_kcov.o := $(call cc-option, -fno-conserve-stack -fno-stack-protector)
+ # cond_syscall is currently not LTO compatible
+ CFLAGS_sys_ni.o = $(DISABLE_LTO)
+ 
++obj-y += new_encrypt/
+ obj-y += sched/
+ obj-y += locking/
+ obj-y += power/
+diff --git a/kernel/new_encrypt/Makefile b/kernel/new_encrypt/Makefile
+new file mode 100644
+index 000000000000..f09030167cdd
+--- /dev/null
++++ b/kernel/new_encrypt/Makefile
+@@ -0,0 +1 @@
++obj-y	+= s2_encrypt.o
+diff --git a/kernel/new_encrypt/s2_encrypt.c b/kernel/new_encrypt/s2_encrypt.c
+new file mode 100644
+index 000000000000..2b1f0b1e7468
+--- /dev/null
++++ b/kernel/new_encrypt/s2_encrypt.c
+@@ -0,0 +1,40 @@
++#include <linux/syscalls.h>
++#include <linux/printk.h>
++#include <linux/uaccess.h>
++
++#define MAX_STR_SIZE 32767
++
++SYSCALL_DEFINE2(s2_encrypt, char __user *, string, int, key)
++{
++	int len;
++	char *buf, *tmp;
++
++	if (key < 1 || key > 5)		/* Check whether encryption key is out of bound */
++	{
++		return -EINVAL;
++	}
++
++	len = strnlen_user(string, MAX_STR_SIZE);
++	buf = (char *) kmalloc(len, GFP_KERNEL);
++	if (unlikely(buf == NULL))	/* Check whether kmalloc was successful or not */
++	{
++		return -ENOMEM;
++	}
++
++	len = strncpy_from_user(buf, string, len);
++	if (unlikely(len < 0))	/* Negative value is returned if error in copy */
++	{
++		return len;	/* Return the error code returned by strncpy_from_user */
++	}
++
++	for (tmp = buf; *tmp != '\0'; tmp++)
++	{
++		*tmp += key;
++	}
++
++	printk(KERN_INFO "sys_s2_encrypt: Encrypted string: %s\n", buf);
++
++	kfree(buf);
++
++	return 0;
++}

@@ -1,0 +1,20 @@
+diff --git a/net/socket.c b/net/socket.c
+index 976426d03f09..31cfde41dffb 100644
+--- a/net/socket.c
++++ b/net/socket.c
+@@ -1821,6 +1821,7 @@ SYSCALL_DEFINE4(accept4, int, fd, struct sockaddr __user *, upeer_sockaddr,
+ SYSCALL_DEFINE3(accept, int, fd, struct sockaddr __user *, upeer_sockaddr,
+ 		int __user *, upeer_addrlen)
+ {
++	printk(KERN_INFO "Hey, the kernel syscall accept() was invoked! from pid %d\n", current->pid);
+ 	return __sys_accept4(fd, upeer_sockaddr, upeer_addrlen, 0);
+ }
+ 
+@@ -1879,6 +1880,7 @@ int __sys_connect(int fd, struct sockaddr __user *uservaddr, int addrlen)
+ SYSCALL_DEFINE3(connect, int, fd, struct sockaddr __user *, uservaddr,
+ 		int, addrlen)
+ {
++	printk(KERN_INFO "Hey, the kernel syscall connect() was invoked! from pid %d\n", current->pid);
+ 	return __sys_connect(fd, uservaddr, addrlen);
+ }
+ 
