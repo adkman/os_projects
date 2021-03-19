@@ -31,15 +31,18 @@ char msi_map[3] = {'M', 'S', 'I'};
 
 enum State {M, S, I};
 
+enum State *msi_array;
+
 enum Instruction {FETCH, INVALIDATE};
 
-enum MessageType {REQUEST, RESPONSE};
+enum MessageType {REQUEST, RESPONSE, ERR_RESPONSE};
+
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
 struct info
 {
     long uffd;
     long sockfd;
-    enum State *msi_array;
     char* addr;
     unsigned long len;
     int num_pages;
@@ -50,65 +53,85 @@ struct message
     enum MessageType msgType;
     enum Instruction instr;
     long pageNum;
-    char *buffer;
+    char buffer[4096];
 };
 
 static int page_size;
 
+void set_socket_blocking_mode(int sockfd, bool isBlocking)
+{
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    flags = isBlocking ? (flags & ~O_NONBLOCK) : (flags | O_NONBLOCK);
+    fcntl(sockfd, F_SETFL, flags);
+}
 
 static void *
 request_listener_thread(void *arg)
 {
     struct info *info = (struct info *)arg;
 
+    set_socket_blocking_mode(info->sockfd, false);
+
     while (true)
     {
         struct message msg;
 
-        do
+        pthread_mutex_lock(&mutex); 
+        errno = 0;
+        if (read(info->sockfd, &msg, sizeof(struct message)) < 0)
         {
-            if (read(info->sockfd, &msg, sizeof(struct message)) < 0)
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
             {
-                fprintf(stderr, "\nRead Failed %s\n", strerror(errno));
+                pthread_mutex_unlock(&mutex);
                 continue;
-            }
-        } while (msg.msgType != REQUEST);
-
-        if (msg.instr == FETCH)
-        {
-            printf("\nReceived FETCH request for page %ld\n", msg.pageNum);
-            msg.msgType = RESPONSE;
-            if (info->msi_array[msg.pageNum] == I)
-            {
-                msg.buffer = NULL; /* This will let the requester know that wo have invalid page */
-                if (send(info->sockfd, &msg, sizeof(struct message), 0) < 0)
-                {
-                    fprintf(stderr, "\nSend Failed %s\n", strerror(errno));
-                    continue;
-                }
             }
             else
             {
-                msg.buffer = malloc(page_size);
-                memcpy(msg.buffer, &info->addr[0x0 + msg.pageNum * page_size], page_size);
-                if (send(info->sockfd, &msg, sizeof(struct message), 0) < 0)
-                {
-                    free(msg.buffer);
-                    fprintf(stderr, "\nSend Failed %s\n", strerror(errno));
-                    continue;
-                }
-                // initial status maybe M or S
-                info->msi_array[msg.pageNum] = S;
-                free(msg.buffer);
+                fprintf(stderr, "\nRead Failed %s\n", strerror(errno));
+                exit(EXIT_FAILURE);
             }
         }
         else
         {
-            printf("\nReceived request for %d\n", msg.instr);
+            if (msg.msgType != REQUEST)
+            {
+                pthread_mutex_unlock(&mutex);
+                continue;
+            }
+        }
+        pthread_mutex_unlock(&mutex);
+
+        if (msg.instr == FETCH)
+        {
+            if (msi_array[msg.pageNum] == I)
+            {
+                msg.msgType = ERR_RESPONSE;
+                if (send(info->sockfd, &msg, sizeof(struct message), 0) < 0)
+                {
+                    fprintf(stderr, "\nSend Failed %s\n", strerror(errno));
+                    exit(EXIT_FAILURE);
+                }
+            }
+            else
+            {
+                msg.msgType = RESPONSE;
+                memcpy(msg.buffer, &info->addr[msg.pageNum * page_size], page_size);
+                if (send(info->sockfd, &msg, sizeof(struct message), 0) < 0)
+                {
+                    fprintf(stderr, "\nSend Failed %s\n", strerror(errno));
+                    exit(EXIT_FAILURE);
+                }
+                msi_array[msg.pageNum] = S;
+            }
+        }
+        else if (msg.instr == INVALIDATE)
+        {
+            msi_array[msg.pageNum] = I;
+            madvise(&info->addr[msg.pageNum * page_size], page_size, MADV_DONTNEED);
         }
     }
 
-    errExit("Should not come here TODO");
+    errExit("Should not reach here");
 }
 
 static void *
@@ -134,7 +157,9 @@ fault_handler_thread(void *arg)
         pollfd.events = POLLIN;
         nready = poll(&pollfd, 1, -1);
         if (nready == -1)
+        {
             errExit("poll");
+        }
 
         nread = read(uffd, &uffd_msg, sizeof(uffd_msg));
         if (nread == 0)
@@ -142,7 +167,9 @@ fault_handler_thread(void *arg)
             errExit("EOF on userfaultfd!");
         }
         if (nread == -1)
+        {
             errExit("read");
+        }
 
         if (uffd_msg.event != UFFD_EVENT_PAGEFAULT)
         {
@@ -150,33 +177,48 @@ fault_handler_thread(void *arg)
             exit(EXIT_FAILURE);
         }
 
-        printf("  [X] PAGEFAULT\n");
-
         /* Assuming pagefault will only happen when MSI state is Invalid */
         pageAddr = (unsigned long)uffd_msg.arg.pagefault.address & 
                     ~(page_size - 1);
-        msg.msgType = REQUEST;
-        msg.instr = FETCH;
         msg.pageNum = (pageAddr - (unsigned long)info->addr) / page_size;
-        msg.buffer = NULL;
 
-        if (send(info->sockfd, &msg, sizeof(struct message), 0) < 0)
+        msg.msgType = REQUEST;
+        if (uffd_msg.arg.pagefault.flags == UFFD_PAGEFAULT_FLAG_WRITE)
         {
-            fprintf(stderr, "\nSend Failed %s\n", strerror(errno));
-            exit(EXIT_FAILURE);
+            msg.instr = INVALIDATE;
+            if (send(info->sockfd, &msg, sizeof(msg), 0) < 0)
+            {
+                fprintf(stderr, "\nSend Failed %s\n", strerror(errno));
+                exit(EXIT_FAILURE);
+            }
+            msi_array[msg.pageNum] = M;
         }
-
-        do
+        else    /* Pagefault on read */
         {
+            msg.instr = FETCH;
+
+            printf("  [X] PAGEFAULT %ld\n", msg.pageNum);
+
+            pthread_mutex_lock(&mutex);
+            set_socket_blocking_mode(info->sockfd, true);
+            if (send(info->sockfd, &msg, sizeof(struct message), 0) < 0)
+            {
+                fprintf(stderr, "\nSend Failed %s\n", strerror(errno));
+                exit(EXIT_FAILURE);
+            }
+
+            /* Assuming that the read call will get appropriate response for the FETCH request */
             if (read(info->sockfd, &msg, sizeof(struct message)) < 0)
             {
                 fprintf(stderr, "\nRead Failed %s\n", strerror(errno));
                 exit(EXIT_FAILURE);
             }
-        } while (msg.msgType != RESPONSE);
+            set_socket_blocking_mode(info->sockfd, false);
+            pthread_mutex_unlock(&mutex);
+        }
 
-        /* Assuming that the read call will get appropriate response for the FETCH request */
-        if (msg.buffer == NULL)     /* The page was Invalid at other process too */
+        if (uffd_msg.arg.pagefault.flags == UFFD_PAGEFAULT_FLAG_WRITE 
+                || msg.msgType == ERR_RESPONSE)     /* The page was Invalid at other process too (in case of read)*/
         {
             uffdio_zeropage.range.start = pageAddr;
             uffdio_zeropage.range.len = page_size;
@@ -191,7 +233,9 @@ fault_handler_thread(void *arg)
         }
         else                        /* Got the page content from other process */
         {
-            uffdio_copy.src = (unsigned long)msg.buffer;
+            msi_array[msg.pageNum] = S;
+
+            uffdio_copy.src = (__u64)msg.buffer;
             uffdio_copy.dst = pageAddr;
             uffdio_copy.len = page_size;
             uffdio_copy.mode = 0;
@@ -202,10 +246,36 @@ fault_handler_thread(void *arg)
 
             if (uffdio_copy.copy != page_size)
                 errExit("Error in UFFDIO_COPY copying");
-
-            info->msi_array[msg.pageNum] = S;
         }
     }
+}
+
+void handle_read_page(char* baseAddr, int pageNum)
+{
+    char* pageAddr = &baseAddr[page_size * pageNum];
+    char page_buffer[page_size];
+
+    memcpy(page_buffer, pageAddr, page_size);   /* Reading page contents */
+    if (msi_array[pageNum] == I)    /* So that next access will again trigger pagefault */
+    {
+        madvise(pageAddr, page_size, MADV_DONTNEED);
+        printf("  [*] Page %i:\n%s\n", pageNum, "");
+    }
+    else
+    {
+        printf("  [*] Page %i:\n%s\n", pageNum, page_buffer);
+    }
+}
+
+void handle_write_page(char* baseAddr, int pageNum, char* page_buffer)
+{
+    char* pageAddr = &baseAddr[page_size * pageNum];
+    if (msi_array[pageNum] == S)    /* So that page fault handler will send INVALIDATE to other process */
+    {
+        madvise(pageAddr, page_size, MADV_DONTNEED);
+    }
+    memcpy(pageAddr, page_buffer, strlen(page_buffer) + 1);  /* Writing on the page */
+    printf("  [*] Page %i:\n%s\n", pageNum, pageAddr);  /* Printing updated contents of page */
 }
 
 int main(int argc, const char *argv[])
@@ -231,7 +301,6 @@ int main(int argc, const char *argv[])
 
     char op;
     int pageNum;
-    enum State *msi_array;
     struct info *info = malloc(sizeof(struct info));
 
     /* Check for appropriate number of arguments */
@@ -246,18 +315,20 @@ int main(int argc, const char *argv[])
     srcPort = strtol(argv[1], NULL, DECIMAL_BASE);
     if (errno != 0)
     {
-        fprintf(stderr, "Error parsing src-port: error code - %d\n", errno);
+        fprintf(stderr, "Error parsing src-port: error code - %s\n", strerror(errno));
         exit(EXIT_FAILURE);
     }
     errno = 0;
     dstPort = strtol(argv[2], NULL, DECIMAL_BASE);
     if (errno != 0)
     {
-        fprintf(stderr, "Error parsing dst-port: error code - %d\n", errno);
+        fprintf(stderr, "Error parsing dst-port: error code - %s\n", strerror(errno));
         exit(EXIT_FAILURE);
     }
-    errno = 0;
 
+    page_size = sysconf(_SC_PAGE_SIZE);
+
+    errno = 0;
     /* Create a socket for this process to communicate */
     if ((client_sock = socket(AF_INET, SOCK_STREAM, 0)) < 0)
     {
@@ -290,8 +361,6 @@ int main(int argc, const char *argv[])
         printf("\nThis is the second process!\n");
         printf("\nProcesses paired!\n");
     }
-
-    page_size = sysconf(_SC_PAGE_SIZE);
 
     if (isFirstProc)
     {
@@ -347,7 +416,7 @@ int main(int argc, const char *argv[])
         sprintf(buffer, "%lu %lu", (unsigned long)addr, len);
         send(client_sock, buffer, strlen(buffer), 0);
 
-        if (getchar() == EOF)
+        if (getchar() == EOF)   /* handles the \n left by scanf */
             errExit("Got EOF at getchar");
     }
     else
@@ -410,21 +479,11 @@ int main(int argc, const char *argv[])
     if (ioctl(uffd, UFFDIO_REGISTER, &uffdio_register) == -1)
         errExit("ioctl-UFFDIO_REGISTER");
 
-
-    info->msi_array = msi_array;
     info->sockfd = client_sock;
     info->addr = addr;
     info->len = len;
     info->num_pages = num_pages;
     info->uffd = uffd;
-
-    /* Creating a thread to monitor and handle the pagefault events */
-    s = pthread_create(&thr, NULL, fault_handler_thread, (void *)info);
-    if (s != 0)
-    {
-        errno = s;
-        errExit("pthread_create");
-    }
 
     /* Creating a thread to monitor and handle the requests from other process */
     s = pthread_create(&thr_request, NULL, request_listener_thread, (void *)info);
@@ -432,6 +491,14 @@ int main(int argc, const char *argv[])
     {
         errno = s;
         errExit("pthread_create request listener");
+    }
+    
+    /* Creating a thread to monitor and handle the pagefault events */
+    s = pthread_create(&thr, NULL, fault_handler_thread, (void *)info);
+    if (s != 0)
+    {
+        errno = s;
+        errExit("pthread_create userfaultfd listener");
     }
 
     /* Repeatedly ask user */
@@ -450,7 +517,7 @@ int main(int argc, const char *argv[])
         if (op != 'r' && op != 'w' && op!= 'v')
         {
             fprintf(stderr, "Invalid operation: only 'r', 'w' and 'v' is supported");
-            continue;
+            exit(EXIT_FAILURE);
         }
 
 
@@ -466,14 +533,14 @@ int main(int argc, const char *argv[])
         pageNum = strtol(buffer, NULL, DECIMAL_BASE);
         if (errno != 0 || (pageNum == 0 && buffer[0] != '0'))
         {
-            fprintf(stderr, "Invalid page number: error code %d\n", errno);
-            continue;
+            fprintf(stderr, "Invalid page number: error code %s\n", strerror(errno));
+            exit(EXIT_FAILURE);
         }
 
         if (pageNum >= num_pages || pageNum < -1)
         {
             fprintf(stderr, "Invalid page number: Should be (0-%i, or -1 for all)\n", num_pages - 1);
-            continue;
+            exit(EXIT_FAILURE);
         }
 
         if (op == 'v')
@@ -490,50 +557,46 @@ int main(int argc, const char *argv[])
                 printf("  MSI state for Page %i: %c\n", pageNum, msi_map[msi_array[pageNum]]);
             }
         }
-        else
+        else if (op == 'w')
         {
-            if (op == 'w')
+            printf("> Type your new message: ");
+            errno = 0;
+            if (fgets(page_buffer, page_size, stdin) == NULL)
             {
-                printf("> Type your new message: ");
-                errno = 0;
-                if (fgets(page_buffer, page_size, stdin) == NULL)
-                {
-                    errExit("fgets error content");
-                }
-
-                page_buffer[strlen(page_buffer) - 1] = '\0';
-
-                /* write the data in buffer into the pageNum(s) */
-                if (pageNum == -1)
-                {
-                    for (int l = 0x0; l < num_pages * page_size; l += page_size)
-                    {
-                        memcpy(&addr[l], page_buffer, strlen(page_buffer) + 1);
-                    }
-                }
-                else
-                {
-                    memcpy(&addr[0x0 + page_size * pageNum], page_buffer, strlen(page_buffer) + 1);
-                }
+                errExit("fgets error content");
             }
+
+            page_buffer[strlen(page_buffer) - 1] = '\0';
+
             if (pageNum == -1)
             {
-                for (int l = 0x0, i = 0; i < num_pages; l += page_size, i++)
+                for (int i = 0; i < num_pages; i++)
                 {
-                    char temp_buffer[page_size];
-
-                    memcpy(temp_buffer, &addr[l], page_size);
-                    printf("  [*] Page %i:\n%s\n", i, temp_buffer);
+                    handle_write_page(addr, i, page_buffer);
                 }
             }
             else
             {
-                memcpy(page_buffer, &addr[0x0 + page_size * pageNum], page_size);
-                printf("  [*] Page %i:\n%s\n", pageNum, page_buffer);
+                handle_write_page(addr, pageNum, page_buffer);
+            }
+        }
+        else if (op == 'r')
+        {
+            if (pageNum == -1)
+            {
+                for (int i = 0; i < num_pages; i++)
+                {
+                    handle_read_page(addr, i);
+                }
+            }
+            else
+            {
+                handle_read_page(addr, pageNum);
             }
         }
     }
 
     free(msi_array);
+    free(info);
     return 0;
 }
