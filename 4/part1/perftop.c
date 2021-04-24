@@ -8,9 +8,15 @@
 
 static spinlock_t pre_count_lock;
 static spinlock_t post_count_lock;
+static spinlock_t context_switch_count_lock;
+
+struct task_data {
+    unsigned long prev;
+};
 
 unsigned long int pre_count = 0;
 unsigned long int post_count = 0;
+unsigned long int context_switch_count = 0;
 
 static int perftop_proc_show(struct seq_file *s, void *v)
 {
@@ -23,6 +29,10 @@ static int perftop_proc_show(struct seq_file *s, void *v)
     spin_lock(&post_count_lock);
     seq_printf(s, "post_count = %lu\n", post_count);
     spin_unlock(&post_count_lock);
+
+    spin_lock(&context_switch_count_lock);
+    seq_printf(s, "context_switch_count = %lu\n", context_switch_count);
+    spin_unlock(&context_switch_count_lock);
 
     return 0;
 }
@@ -41,18 +51,37 @@ static const struct proc_ops perftop_proc_ops = {
 
 static int entry_pick_next_fair(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
+    struct task_data *data;
+
     spin_lock(&pre_count_lock);
     pre_count++;
     spin_unlock(&pre_count_lock);
+
+    data = (struct task_data *)ri->data;
+    data->prev = regs->si; // Second argument of pick_next_task_fair
+
     return 0;
 }
 NOKPROBE_SYMBOL(entry_pick_next_fair);
 
 static int ret_pick_next_fair(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
+    struct task_data *data;
+
     spin_lock(&post_count_lock);
     post_count++;
     spin_unlock(&post_count_lock);
+
+    data = (struct task_data *)ri->data;
+//    printk("%lu\t->\t%lu\n", data->prev, regs->ax);
+
+    if (data->prev != regs->ax) // regs->ax will contain the return value of pick_next_task_fair
+    {
+        spin_lock(&context_switch_count_lock);
+        context_switch_count++;
+        spin_unlock(&context_switch_count_lock);
+    }
+
     return 0;
 }
 NOKPROBE_SYMBOL(ret_pick_next_fair);
@@ -60,7 +89,7 @@ NOKPROBE_SYMBOL(ret_pick_next_fair);
 static struct kretprobe my_kretprobe = {
     .handler = ret_pick_next_fair,
     .entry_handler = entry_pick_next_fair,
-    .maxactive = 1000
+    .maxactive = 9999
 };
 
 static int __init on_init(void)
@@ -69,6 +98,7 @@ static int __init on_init(void)
 
     spin_lock_init(&pre_count_lock);
     spin_lock_init(&post_count_lock);
+    spin_lock_init(&context_switch_count_lock);
 
     proc_create("perftop", 0, NULL, &perftop_proc_ops);
     my_kretprobe.kp.symbol_name = "pick_next_task_fair";
