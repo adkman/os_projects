@@ -12,45 +12,66 @@
 static spinlock_t pre_count_lock;
 static spinlock_t post_count_lock;
 static spinlock_t context_switch_count_lock;
+static spinlock_t hasht_lock;
+static spinlock_t rbtree_lock;
 
-struct prev_task_data {
-    unsigned long prev;
+unsigned long int pre_count = 0;
+unsigned long int post_count = 0;
+unsigned long int context_switch_count = 0;
+
+struct task_data {
+    struct task_struct *prev;
 };
 
 struct my_hashmap {
-    DECLARE_HASHTABLE(my_hasht, 14);
+    DECLARE_HASHTABLE(my_hasht, 10);
 };
 struct my_hashmap *my_hashm; 
-
-struct rb_root sched_tasks_rbtree = RB_ROOT;
-
-struct task_entity {
+struct hasht_entity {
     pid_t pid;
     unsigned long long start_tsc;
+    struct hlist_node node;
+};
+
+struct rb_root sched_tasks_rbtree = RB_ROOT;
+struct rbtree_entity {
+    pid_t pid;
     unsigned long long total_tsc;
-    struct hlist_node ht_node;
-    struct rb_node rbt_node;
+    struct rb_node node;
 };
 
 /* Hash Table methods - START */
+static void iterate_hasht(struct my_hashmap *hashm)
+{
+    unsigned int bkt;
+    struct hasht_entity *curr;
+
+    hash_for_each(hashm->my_hasht, bkt, curr, node)
+    {
+        printk("Hash Table: %p|%ld|%d|%llu|%p\n", curr, sizeof(curr), curr->pid, curr->start_tsc, &curr->node);
+    }
+}
+
 static void add_to_hashm(pid_t pid, unsigned long long start_tsc, struct my_hashmap *hashm)
 {
     u32 key = jhash(&pid, sizeof(pid_t), 0);
-    struct task_entity *entity;
+    struct hasht_entity *entity;
 
-    entity = kmalloc(sizeof(struct task_entity), GFP_KERNEL);
+    entity = kmalloc(sizeof(struct hasht_entity), GFP_KERNEL);
     entity->pid = pid;
     entity->start_tsc = start_tsc;
 
-    hash_add(hashm->my_hasht, &entity->ht_node, key);
+    printk("added %p\n", entity);
+
+    hash_add(hashm->my_hasht, &entity->node, key);
 }
 
-static struct task_entity * get_entity_from_hashmap(pid_t pid, struct my_hashmap *hashm)
+static struct hasht_entity * get_entity_from_hashmap(pid_t pid, struct my_hashmap *hashm)
 {
     u32 key = jhash(&pid, sizeof(pid_t), 0);
-    struct task_entity *entity;
+    struct hasht_entity *entity;
 
-    hash_for_each_possible(hashm->my_hasht, entity, ht_node, key) {
+    hash_for_each_possible(hashm->my_hasht, entity, node, key) {
         if (entity->pid == pid) {
             return entity;
         }
@@ -61,45 +82,53 @@ static struct task_entity * get_entity_from_hashmap(pid_t pid, struct my_hashmap
 void del_from_hashmap(pid_t pid, struct my_hashmap *hashm)
 {
     u32 key = jhash(&pid, sizeof(pid_t), 0);
-    struct task_entity *entity;
+    struct hasht_entity *entity;
+    struct hlist_node *tmp;
 
-    hash_for_each_possible(hashm->my_hasht, entity, ht_node, key) {
+    hash_for_each_possible_safe(hashm->my_hasht, entity, tmp, node, key) {
         if (entity->pid == pid) {
-            hash_del(&entity->ht_node);
+            hash_del(&entity->node);
             kfree(entity);
             return;
         }
     }
 }
 
-static void destruct_hashm(struct my_hashmap *hashm)
+static void destruct_hashmap(struct my_hashmap *hashm)
 {
     if (!hash_empty(hashm->my_hasht))
     {
         unsigned int bkt;
-        struct task_entity *entity;
+        struct hasht_entity *entity;
+        struct hlist_node *tmp;
 
-        hash_for_each(hashm->my_hasht, bkt,entity, ht_node)
+        hash_for_each_safe(hashm->my_hasht, bkt, tmp, entity, node)
         {
-            hash_del(&entity->ht_node);
+            printk("Hash Table: %p|%ld|%d|%llu|%p|\n", entity, sizeof(entity), entity->pid, entity->start_tsc, &entity->node);
+            hash_del(&entity->node);
+            printk("hash deleted\n");
             kfree(entity);
+            printk("kfree entity\n");
         }
     }
+    printk("freeing hashm\n");
     kfree(hashm);
+    printk("freed hashm\n");
 }
 /* Hash Table methods - END */
 
 /* Red-Black Tree methods - START */
-static void insert_rbtree(struct task_entity *entity, struct rb_root *tree_root)
+/*
+static void insert_rbtree(struct rbtree_entity *entity, struct rb_root *tree_root)
 {
     struct rb_node **curr = &tree_root->rb_node;
     struct rb_node *parent = NULL;
-    struct task_entity *temp;
+    struct rbtree_entity *temp;
 
     while (*curr)
     {
         parent = *curr;
-        temp = rb_entry(parent, struct task_entity, rbt_node);
+        temp = rb_entry(parent, struct rbtree_entity, node);
         if (entity->total_tsc > temp->total_tsc)
         {
             curr = &parent->rb_left;
@@ -109,20 +138,20 @@ static void insert_rbtree(struct task_entity *entity, struct rb_root *tree_root)
             curr = &parent->rb_right;
         }
     }
-    rb_link_node(&entity->rbt_node, parent, curr);
-    rb_insert_color(&entity->rbt_node, tree_root);
+    rb_link_node(&entity->node, parent, curr);
+    rb_insert_color(&entity->node, tree_root);
 }
 
-static struct task_entity * lookup_and_remove(pid_t pid, struct rb_root *tree_root)
+static struct rbtree_entity * lookup_and_remove(pid_t pid, struct rb_root *tree_root)
 {
     struct rb_node *tmp_node;
-    struct task_entity *data;
+    struct rbtree_entity *data;
 
     data = NULL;
     tmp_node = rb_first(tree_root);
     while (tmp_node)
     {
-        data = rb_entry(tmp_node, struct task_entity, rbt_node);
+        data = rb_entry(tmp_node, struct rbtree_entity, node);
         if (data->pid == pid)
         {
             rb_erase(tmp_node, tree_root);
@@ -132,18 +161,18 @@ static struct task_entity * lookup_and_remove(pid_t pid, struct rb_root *tree_ro
     }
     return data;
 }
-
-static void printTopTen(struct rb_root *tree_root)
+*/
+static void printTopTen(struct rb_root *tree_root, struct seq_file *s)
 {
     int t = 10;
     struct rb_node *curr;
-    struct task_entity *data;
+    struct rbtree_entity *data;
 
     curr = rb_first(tree_root);
     while (t-- && curr)
     {
-        data = rb_entry(curr, struct task_entity, rbt_node);
-        printk("PID: %d, Total tsc: %llu\n", data->pid, data->total_tsc);
+        data = rb_entry(curr, struct rbtree_entity, node);
+        seq_printf(s, "PID: %d, Total tsc: %llu\n", data->pid, data->total_tsc);
         curr = rb_next(curr);
     }
 }
@@ -151,23 +180,19 @@ static void printTopTen(struct rb_root *tree_root)
 static void destruct_rbtree(struct rb_root *tree_root)
 {
     struct rb_node *tmp_node, *next_node;
-    struct task_entity *entity;
+    struct rbtree_entity *entity;
 
     tmp_node = rb_first(tree_root);
     while(tmp_node)
     {
         next_node = rb_next(tmp_node);
-        entity = rb_entry(tmp_node, struct task_entity, rbt_node);
+        entity = rb_entry(tmp_node, struct rbtree_entity, node);
         rb_erase(tmp_node, tree_root);
         kfree(entity);
         tmp_node = next_node;
     }
 }
 /* Red-Black Tree methods - END */
-
-unsigned long int pre_count = 0;
-unsigned long int post_count = 0;
-unsigned long int context_switch_count = 0;
 
 static int perftop_proc_show(struct seq_file *s, void *v)
 {
@@ -185,7 +210,9 @@ static int perftop_proc_show(struct seq_file *s, void *v)
     seq_printf(s, "context_switch_count = %lu\n", context_switch_count);
     spin_unlock(&context_switch_count_lock);
 
-    printTopTen(&sched_tasks_rbtree);
+    spin_lock(&rbtree_lock);
+    printTopTen(&sched_tasks_rbtree, s);
+    spin_unlock(&rbtree_lock);
 
     return 0;
 }
@@ -204,39 +231,41 @@ static const struct proc_ops perftop_proc_ops = {
 
 static int entry_pick_next_fair(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    struct prev_task_data *prev_data;
-    struct task_struct *prev;
-    struct task_entity *hashed_entity, *tree_entity;
-    unsigned long long elapsed_tsc;
+    struct task_data *prev_data;
+    struct hasht_entity *hashed_entity;
+    //struct rbtree_entity *tree_entity;
+    //unsigned long long elapsed_tsc;
 
-    spin_lock(&pre_count_lock);
-    pre_count++;
-    spin_unlock(&pre_count_lock);
+    prev_data = (struct task_data *)ri->data;
+    prev_data->prev = (struct task_struct *)regs->si;
 
-    prev_data = (struct prev_task_data *)ri->data;
-    prev_data->prev = regs->si; // Second argument of pick_next_task_fair
-
-    prev = (struct task_struct *)regs->si;
-
-    hashed_entity = get_entity_from_hashmap(prev->pid, my_hashm);
-    if (hashed_entity != NULL)
+    if (prev_data->prev != NULL)
     {
-        elapsed_tsc = rdtsc() - hashed_entity->start_tsc;
-
-        // Remove previous entry of prev->pid from rbtree
-        tree_entity = lookup_and_remove(prev->pid, &sched_tasks_rbtree);
-        // Create a new entry with cumulative tsc in rbree
-        if (tree_entity != NULL)
+        spin_lock(&hasht_lock);
+        hashed_entity = get_entity_from_hashmap(prev_data->prev->pid, my_hashm);
+        spin_unlock(&hasht_lock);
+        if (hashed_entity != NULL)
         {
-            tree_entity->total_tsc += elapsed_tsc;
-            insert_rbtree(tree_entity, &sched_tasks_rbtree);
-        }
-        else
-        {
-            tree_entity = kmalloc(sizeof(struct task_entity), GFP_KERNEL);
-            tree_entity->pid = prev->pid;
-            tree_entity->total_tsc = elapsed_tsc;
-            insert_rbtree(tree_entity, &sched_tasks_rbtree);
+            /*
+            elapsed_tsc = rdtsc() - hashed_entity->start_tsc;
+            // Remove previous entry of prev->pid from rbtree
+            spin_lock(&rbtree_lock);
+            tree_entity = lookup_and_remove(prev_data->prev->pid, &sched_tasks_rbtree);
+            // Create a new entry with cumulative tsc in rbree
+            if (tree_entity != NULL)
+            {
+                tree_entity->total_tsc += elapsed_tsc;
+                insert_rbtree(tree_entity, &sched_tasks_rbtree);
+            }
+            else
+            {
+                tree_entity = kmalloc(sizeof(struct rbtree_entity), GFP_KERNEL);
+                tree_entity->pid = prev_data->prev->pid;
+                tree_entity->total_tsc = elapsed_tsc;
+                insert_rbtree(tree_entity, &sched_tasks_rbtree);
+            }
+            spin_unlock(&rbtree_lock);
+            */
         }
     }
 
@@ -246,29 +275,31 @@ NOKPROBE_SYMBOL(entry_pick_next_fair);
 
 static int ret_pick_next_fair(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
-    struct prev_task_data *prev_data;
+    struct task_data *prev_data;
     struct task_struct *next;
     unsigned long long current_tsc;
 
-    spin_lock(&post_count_lock);
-    post_count++;
-    spin_unlock(&post_count_lock);
-
-    prev_data = (struct prev_task_data *)ri->data;
-
     next = (struct task_struct *)regs->ax; // regs->ax will contain the return value of pick_next_task_fair
 
-    if (prev_data->prev != regs->ax)
+    prev_data = (struct task_data *)ri->data;
+
+    if (prev_data->prev != next)
     {
         spin_lock(&context_switch_count_lock);
         context_switch_count++;
         spin_unlock(&context_switch_count_lock);
-    }
+        
+        if (next != NULL)
+        {
+            // Updating start_tsc for next->pid in hashtable
+            spin_lock(&hasht_lock);
+            //del_from_hashmap(next->pid, my_hashm);
 
-    current_tsc = rdtsc();
-    // Updating start_tsc for next->pid in hashtable
-    del_from_hashmap(next->pid, my_hashm);
-    add_to_hashm(next->pid, current_tsc, my_hashm);
+            current_tsc = rdtsc();
+            add_to_hashm(next->pid, current_tsc, my_hashm);
+            spin_unlock(&hasht_lock);
+        }
+    }
 
     return 0;
 }
@@ -287,6 +318,8 @@ static int __init on_init(void)
     spin_lock_init(&pre_count_lock);
     spin_lock_init(&post_count_lock);
     spin_lock_init(&context_switch_count_lock);
+    spin_lock_init(&hasht_lock);
+    spin_lock_init(&rbtree_lock);
 
     my_hashm = kmalloc(sizeof(struct my_hashmap), GFP_KERNEL);
     hash_init(my_hashm->my_hasht);
@@ -310,8 +343,9 @@ static void __exit on_exit(void)
     unregister_kretprobe(&my_kretprobe);
     printk("Missed probing %d instances of %s\n", my_kretprobe.nmissed, my_kretprobe.kp.symbol_name);
 
-    destruct_hashm(my_hashm);
-
+    iterate_hasht(my_hashm);
+    destruct_hashmap(my_hashm);
+    
     destruct_rbtree(&sched_tasks_rbtree);
 
     remove_proc_entry("perftop", NULL);
@@ -322,4 +356,4 @@ module_exit(on_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Manish Adkar <madkar@cs.stonybrook.edu>");
-MODULE_DESCRIPTION("Project 4 part 1");
+MODULE_DESCRIPTION("Project 4 part 2");
