@@ -4,7 +4,6 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/kprobes.h>
-#include <linux/spinlock.h>
 #include <linux/hashtable.h>
 #include <linux/jhash.h>
 #include <linux/slab.h>
@@ -57,11 +56,9 @@ static void add_to_hashm(pid_t pid, unsigned long long start_tsc, struct my_hash
     u32 key = jhash(&pid, sizeof(pid_t), 0);
     struct hasht_entity *entity;
 
-    entity = kmalloc(sizeof(struct hasht_entity), GFP_KERNEL);
+    entity = kmalloc(sizeof(struct hasht_entity), GFP_ATOMIC);
     entity->pid = pid;
     entity->start_tsc = start_tsc;
-
-    printk("added %p\n", entity);
 
     hash_add(hashm->my_hasht, &entity->node, key);
 }
@@ -79,21 +76,6 @@ static struct hasht_entity * get_entity_from_hashmap(pid_t pid, struct my_hashma
     return NULL;
 }
 
-void del_from_hashmap(pid_t pid, struct my_hashmap *hashm)
-{
-    u32 key = jhash(&pid, sizeof(pid_t), 0);
-    struct hasht_entity *entity;
-    struct hlist_node *tmp;
-
-    hash_for_each_possible_safe(hashm->my_hasht, entity, tmp, node, key) {
-        if (entity->pid == pid) {
-            hash_del(&entity->node);
-            kfree(entity);
-            return;
-        }
-    }
-}
-
 static void destruct_hashmap(struct my_hashmap *hashm)
 {
     if (!hash_empty(hashm->my_hasht))
@@ -104,21 +86,16 @@ static void destruct_hashmap(struct my_hashmap *hashm)
 
         hash_for_each_safe(hashm->my_hasht, bkt, tmp, entity, node)
         {
-            printk("Hash Table: %p|%ld|%d|%llu|%p|\n", entity, sizeof(entity), entity->pid, entity->start_tsc, &entity->node);
             hash_del(&entity->node);
-            printk("hash deleted\n");
             kfree(entity);
-            printk("kfree entity\n");
         }
     }
-    printk("freeing hashm\n");
     kfree(hashm);
-    printk("freed hashm\n");
 }
 /* Hash Table methods - END */
 
 /* Red-Black Tree methods - START */
-/*
+
 static void insert_rbtree(struct rbtree_entity *entity, struct rb_root *tree_root)
 {
     struct rb_node **curr = &tree_root->rb_node;
@@ -161,7 +138,7 @@ static struct rbtree_entity * lookup_and_remove(pid_t pid, struct rb_root *tree_
     }
     return data;
 }
-*/
+
 static void printTopTen(struct rb_root *tree_root, struct seq_file *s)
 {
     int t = 10;
@@ -233,8 +210,12 @@ static int entry_pick_next_fair(struct kretprobe_instance *ri, struct pt_regs *r
 {
     struct task_data *prev_data;
     struct hasht_entity *hashed_entity;
-    //struct rbtree_entity *tree_entity;
-    //unsigned long long elapsed_tsc;
+    struct rbtree_entity *tree_entity;
+    unsigned long long elapsed_tsc;
+
+    spin_lock(&pre_count_lock);
+    pre_count++;
+    spin_unlock(&pre_count_lock);
 
     prev_data = (struct task_data *)ri->data;
     prev_data->prev = (struct task_struct *)regs->si;
@@ -246,12 +227,10 @@ static int entry_pick_next_fair(struct kretprobe_instance *ri, struct pt_regs *r
         spin_unlock(&hasht_lock);
         if (hashed_entity != NULL)
         {
-            /*
             elapsed_tsc = rdtsc() - hashed_entity->start_tsc;
-            // Remove previous entry of prev->pid from rbtree
             spin_lock(&rbtree_lock);
             tree_entity = lookup_and_remove(prev_data->prev->pid, &sched_tasks_rbtree);
-            // Create a new entry with cumulative tsc in rbree
+            // Update / Create a new entry with cumulative tsc in rbtree
             if (tree_entity != NULL)
             {
                 tree_entity->total_tsc += elapsed_tsc;
@@ -259,13 +238,13 @@ static int entry_pick_next_fair(struct kretprobe_instance *ri, struct pt_regs *r
             }
             else
             {
-                tree_entity = kmalloc(sizeof(struct rbtree_entity), GFP_KERNEL);
+                tree_entity = kmalloc(sizeof(struct rbtree_entity), GFP_ATOMIC);
                 tree_entity->pid = prev_data->prev->pid;
                 tree_entity->total_tsc = elapsed_tsc;
                 insert_rbtree(tree_entity, &sched_tasks_rbtree);
             }
+
             spin_unlock(&rbtree_lock);
-            */
         }
     }
 
@@ -277,7 +256,12 @@ static int ret_pick_next_fair(struct kretprobe_instance *ri, struct pt_regs *reg
 {
     struct task_data *prev_data;
     struct task_struct *next;
+    struct hasht_entity *hashed_entity;
     unsigned long long current_tsc;
+
+    spin_lock(&post_count_lock);
+    post_count++;
+    spin_unlock(&post_count_lock);
 
     next = (struct task_struct *)regs->ax; // regs->ax will contain the return value of pick_next_task_fair
 
@@ -292,11 +276,18 @@ static int ret_pick_next_fair(struct kretprobe_instance *ri, struct pt_regs *reg
         if (next != NULL)
         {
             // Updating start_tsc for next->pid in hashtable
-            spin_lock(&hasht_lock);
-            //del_from_hashmap(next->pid, my_hashm);
-
             current_tsc = rdtsc();
-            add_to_hashm(next->pid, current_tsc, my_hashm);
+
+            spin_lock(&hasht_lock);
+            hashed_entity = get_entity_from_hashmap(next->pid, my_hashm);
+            if (hashed_entity == NULL)
+            {
+                add_to_hashm(next->pid, current_tsc, my_hashm);
+            }
+            else
+            {
+                hashed_entity->start_tsc = current_tsc;
+            }
             spin_unlock(&hasht_lock);
         }
     }
@@ -308,6 +299,7 @@ NOKPROBE_SYMBOL(ret_pick_next_fair);
 static struct kretprobe my_kretprobe = {
     .handler = ret_pick_next_fair,
     .entry_handler = entry_pick_next_fair,
+    .data_size = sizeof(struct task_data),
     .maxactive = 9999
 };
 
