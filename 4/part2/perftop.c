@@ -91,7 +91,7 @@ static void printTopTen(struct rb_root *tree_root, struct seq_file *s)
     while (t-- && curr)
     {
         data = rb_entry(curr, struct task_entity, rbt_node);
-        seq_printf(s, "%2d) PID:%9d\tTotal tsc:\t%21llu\n", 10 - t, data->pid, data->total_tsc);
+        seq_printf(s, "%2d) PID:%9d\tTotal tsc:%24llu\n", 10 - t, data->pid, data->total_tsc);
         curr = rb_next(curr);
     }
 }
@@ -152,8 +152,6 @@ static const struct proc_ops perftop_proc_ops = {
 static int entry_pick_next_fair(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
     struct task_data *prev_data;
-    struct task_entity *entity;
-    unsigned long long elapsed_tsc;
 
     spin_lock(&pre_count_lock);
     pre_count++;
@@ -161,27 +159,6 @@ static int entry_pick_next_fair(struct kretprobe_instance *ri, struct pt_regs *r
 
     prev_data = (struct task_data *)ri->data;
     prev_data->prev = (struct task_struct *)regs->si;
-
-    if (prev_data->prev != NULL)
-    {
-        spin_lock(&hasht_lock);
-        entity = lookup_hashmap(prev_data->prev->pid, my_hashm);
-        spin_unlock(&hasht_lock);
-
-        if (entity != NULL)
-        {
-            elapsed_tsc = rdtsc() - entity->start_tsc;
-            
-            spin_lock(&rbtree_lock);
-
-            rb_erase(&entity->rbt_node, &sched_tasks_rbtree);
-
-            entity->total_tsc += elapsed_tsc;
-            add_to_rbtree(entity, &sched_tasks_rbtree);
-
-            spin_unlock(&rbtree_lock);
-        }
-    }
 
     return 0;
 }
@@ -191,8 +168,8 @@ static int ret_pick_next_fair(struct kretprobe_instance *ri, struct pt_regs *reg
 {
     struct task_data *prev_data;
     struct task_struct *next;
-    struct task_entity *entity;
-    unsigned long long current_tsc;
+    struct task_entity *prev_entity, *next_entity;
+    unsigned long long current_tsc, elapsed_tsc;
 
     spin_lock(&post_count_lock);
     post_count++;
@@ -207,28 +184,53 @@ static int ret_pick_next_fair(struct kretprobe_instance *ri, struct pt_regs *reg
         spin_lock(&context_switch_count_lock);
         context_switch_count++;
         spin_unlock(&context_switch_count_lock);
-        
+
+        if (prev_data->prev != NULL)
+        {
+            spin_lock(&hasht_lock);
+            prev_entity = lookup_hashmap(prev_data->prev->pid, my_hashm);
+            spin_unlock(&hasht_lock);
+
+            current_tsc = rdtsc();
+
+            if (prev_entity != NULL)
+            {
+                elapsed_tsc = current_tsc - prev_entity->start_tsc;
+                
+                spin_lock(&rbtree_lock);
+
+                rb_erase(&prev_entity->rbt_node, &sched_tasks_rbtree);
+
+                prev_entity->total_tsc += elapsed_tsc;
+                add_to_rbtree(prev_entity, &sched_tasks_rbtree);
+
+                spin_unlock(&rbtree_lock);
+            }
+        }
+   
         if (next != NULL)
         {
             // Updating start_tsc for next->pid in hashtable
-            current_tsc = rdtsc();
 
             spin_lock(&hasht_lock);
 
-            entity = lookup_hashmap(next->pid, my_hashm);
-            if (entity == NULL) // Add a new entity in the hashtable and the red-black tree
+            next_entity = lookup_hashmap(next->pid, my_hashm);
+            if (next_entity == NULL) // Add a new entity in the hashtable and the red-black tree
             {
-                entity = kmalloc(sizeof(struct task_entity), GFP_ATOMIC);
-                entity->pid = next->pid;
-                entity->start_tsc = current_tsc;
+                next_entity = kmalloc(sizeof(struct task_entity), GFP_ATOMIC);
+                next_entity->pid = next->pid;
+                next_entity->start_tsc = current_tsc;
+                next_entity->total_tsc = 0;
 
-                add_to_hashm(entity, my_hashm);
+                add_to_hashm(next_entity, my_hashm);
 
-                add_to_rbtree(entity, &sched_tasks_rbtree);
+                spin_lock(&rbtree_lock);
+                add_to_rbtree(next_entity, &sched_tasks_rbtree);
+                spin_unlock(&rbtree_lock);
             }
             else                // Update the start tsc in the hashtable entity
             {
-                entity->start_tsc = current_tsc;
+                next_entity->start_tsc = current_tsc;
             }
 
             spin_unlock(&hasht_lock);
