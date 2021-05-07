@@ -119,7 +119,7 @@ static struct super_operations s2fs_s_ops = {
     .drop_inode = generic_delete_inode,
 };
 
-static int s2fs_fill_super(struct super_block *sb,
+int s2fs_fill_super(struct super_block *sb,
         void *data, int silent)
 {
     struct dentry *root_dentry, *subdir_dentry;
